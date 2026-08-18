@@ -105,6 +105,19 @@ func buildMilestoneCard(emoji, template, title, body string) (string, error) {
 	})
 }
 
+// SendMarkdown sends a markdown-body card (no header) so **bold** and other
+// CommonMark syntax render in Feishu. Falls back to plain-text Send when
+// card building fails. Used by intake replies that carry markdown formatting
+// (e.g. goal_query list output).
+func (n *Notifier) SendMarkdown(text string) error {
+	cardJSON, err := feishu.BuildCard(&card.Card{Content: text})
+	if err != nil {
+		return n.Send(text)
+	}
+	_, err = n.SendCard(cardJSON)
+	return err
+}
+
 // buildAskCard is the agent-question card (决策 7-3): an agent asked the human
 // a question via `goal comment --ask`. The card carries a structured body
 // (the goal title + the question) and a FORM the human fills inline — the

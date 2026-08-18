@@ -108,9 +108,10 @@ func (s *IntakeService) BuildPrompt(ctx context.Context, text string) (string, e
 	b.WriteString("用户消息：\n" + text + "\n\n")
 	b.WriteString(`intake.json 结构：
 {
-  "intent": "create_goal|review_list|goal_status|create_schedule|schedule_list|schedule_stop|create_agent|create_squad|unknown",
+  "intent": "create_goal|review_list|goal_status|goal_query|create_schedule|schedule_list|schedule_stop|create_agent|create_squad|unknown",
   "goal": {"title": "", "description": "", "assignee_id": "", "domain_id": ""},
   "goal_id": "",
+  "goal_query": {"status": "", "last_n": 0, "from_date": "", "to_date": ""},
   "schedule": {"name": "", "title": "", "description": "", "cron": "", "assignee_id": "", "domain_id": ""},
   "agent": {"name": "", "runtime_id": "", "description": "", "system_prompt": "", "skills": [], "skills_specified": false},
   "squad": {"name": "", "leader_id": "", "description": "", "instructions": "", "member_ids": []}
@@ -122,6 +123,7 @@ func (s *IntakeService) BuildPrompt(ctx context.Context, text string) (string, e
   domain_id 是【必要参数】：只有当用户的消息明确提到某个仓库/域（"在 test-repo 上做 xxx"、"给 agentwork 加个功能"）时才填；用户没明确指定时 domain_id 留空字符串（不要猜、不要选第一个）——平台会反问用户指定仓库。有多个可用域时尤其不能猜。
 - review_list：用户想查看待审批/卡点清单。不需要其他字段。
 - goal_status：用户问某个任务/目标的状态。goal_id 填用户提到的 id（可能是短 id，照抄）。
+- goal_query：用户想查看任务列表/查询任务（"查看任务"、"查看已完成的任务"、"进行中的任务"、"最近一条已完成的任务"、"最近三条已完成的任务"等）。goal_query.status 填状态限定词（done/active/backlog/failed/review/cancelled），用户没指定状态时留空表示全部；goal_query.last_n 填"最近 N 条"的 N（用户说"最近一条"填1、"最近三条"填3，没提"最近"填0表示全部，最多展示30条）；goal_query.from_date 和 goal_query.to_date 填创建时间区间的起止日期（格式 YYYY-MM-DD，如"2026-01-01 到 2026-08-01 已完成的任务"），用户没提日期区间时留空。
 - create_schedule：用户想创建定时任务/周期性任务（"每 1 个小时做 xxx"、"每天 9 点跑 xxx"、"每周一 xxx"）。schedule.name 填简短任务名；schedule.title 填每次触发时创建的任务标题；schedule.cron 把自然语言频率转成 5 段标准 cron 表达式；schedule.assignee_id 和 schedule.domain_id 从名单里选（必须真实存在）。
 - schedule_list：用户想查看定时任务/计划任务清单。不需要其他字段。
 - schedule_stop：用户想停掉/取消某个定时任务。schedule.name 填用户提到的定时任务名（照抄用户说的名字，可以不完全匹配）。
@@ -141,7 +143,7 @@ cron 转换规则（自然语言频率 → 5 段 cron，时区按用户本地时
 - 每月 X 日 Y 点：Y X X * *
 - 无法可靠转换就 intent=unknown，别编造 cron。
 
-规则：intent 只能填上面九个值之一；id 只能从名单里选，不得编造；无法确定就 unknown。
+规则：intent 只能填上面十个值之一；id 只能从名单里选，不得编造；无法确定就 unknown。
 `)
 	b.WriteString("\n当前可用 agent（id: name）：\n")
 	if agents, err := s.qs.Agents(ctx); err == nil {

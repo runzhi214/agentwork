@@ -128,6 +128,9 @@ type intakeAction struct {
 	Intent string `json:"intent"`
 	Goal   goalAction `json:"goal"`
 	GoalID string     `json:"goal_id"`
+	// GoalQuery carries the goal_query fields (list/filter goals by status
+	// and/or completion time). Kept as a named type for clarity.
+	GoalQuery goalQueryAction `json:"goal_query"`
 	// Schedule carries the parsed定时任务 fields (create_schedule / schedule_stop).
 	// Kept anonymous — it does not participate in the create-draft/merge flow.
 	Schedule struct {
@@ -148,6 +151,18 @@ type goalAction struct {
 	Description string `json:"description"`
 	AssigneeID  string `json:"assignee_id"`
 	DomainID    string `json:"domain_id"`
+}
+
+// goalQueryAction carries the goal_query fields: status filters by goal
+// status (done/active/backlog/failed/review/cancelled; empty = all),
+// last_n limits to the N most recent goals (0 = all, capped at 30),
+// and from_date/to_date optionally filter by goal created_at
+// (YYYY-MM-DD; empty = unbounded).
+type goalQueryAction struct {
+	Status   string `json:"status"`
+	LastN    int    `json:"last_n"`
+	FromDate string `json:"from_date"`
+	ToDate   string `json:"to_date"`
 }
 
 // agentAction carries the create_agent fields. Technical config (env/model/
@@ -184,6 +199,8 @@ func (d *Daemon) replyIntake(ctx context.Context, q *service.ClaimedRow, parsed 
 		reply = d.intakeReviewList(ctx)
 	case "goal_status":
 		reply = d.intakeGoalStatus(ctx, parsed.GoalID)
+	case "goal_query":
+		reply = d.intakeGoalQuery(ctx, parsed.GoalQuery)
 	case "create_schedule":
 		reply = d.intakeCreateSchedule(ctx, parsed)
 	case "schedule_list":
@@ -195,7 +212,7 @@ func (d *Daemon) replyIntake(ctx context.Context, q *service.ClaimedRow, parsed 
 	case "create_squad":
 		reply = d.intakeCreateSquad(ctx, parsed)
 	default:
-		reply = "没听懂这条指令 😅 你可以这样问我：\n- “创建任务 <标题>，让 <agent> 在 <domain> 上做 <描述>”\n- “查看待审批”\n- “查询任务状态 <id>”\n- “每 1 个小时做 <任务>”\n- “查看定时任务”\n- “停掉定时任务 <名字>”\n- “创建 agent <名字>，用 <运行时>，<人设描述>”\n- “创建 squad <名字>，leader 是 <agent>，成员有 <agent1> <agent2>”"
+		reply = "没听懂这条指令 😅 你可以这样问我：\n- “创建任务 <标题>，让 <agent> 在 <domain> 上做 <描述>”\n- “查看待审批”\n- “查询任务状态 <id>”\n- “查看任务列表”\n- “查看已完成的任务”\n- “最近一条已完成的任务”\n- “查看 2026-01-01 到 2026-08-01 已完成的任务”\n- “每 1 个小时做 <任务>”\n- “查看定时任务”\n- “停掉定时任务 <名字>”\n- “创建 agent <名字>，用 <运行时>，<人设描述>”\n- “创建 squad <名字>，leader 是 <agent>，成员有 <agent1> <agent2>”"
 	}
 	if _, err := d.st.DB().ExecContext(ctx,
 		`UPDATE run SET status='completed', result_summary=?, finished_at=? WHERE id=?`,
@@ -203,7 +220,13 @@ func (d *Daemon) replyIntake(ctx context.Context, q *service.ClaimedRow, parsed 
 		logging.Infof("daemon: finish intake run %s: %v", q.RunID, err)
 	}
 	if n := d.imNotifier(); n != nil {
-		if err := n.Send(reply); err != nil {
+		var err error
+		if parsed.Intent == "goal_query" {
+			err = n.SendMarkdown(reply)
+		} else {
+			err = n.Send(reply)
+		}
+		if err != nil {
 			logging.Errorf("daemon: intake reply: %v", err)
 		}
 	}
@@ -331,6 +354,191 @@ func (d *Daemon) intakeGoalStatus(ctx context.Context, id string) string {
 	if v.Summary != "" {
 		b.WriteString("\n最近结果：" + truncateIn(v.Summary, 200))
 	}
+	return b.String()
+}
+
+// goalStatusLabels maps goal status values to Chinese display labels for the
+// goal_query reply header.
+var goalStatusLabels = map[string]string{
+	"done":      "已完成的任务",
+	"active":    "进行中的任务",
+	"backlog":   "待办任务",
+	"failed":    "失败的任务",
+	"review":    "待审批的任务",
+	"cancelled": "已取消的任务",
+}
+
+const maxGoalListSize = 30
+
+// intakeGoalQuery answers "查看任务列表" / "查看已完成的任务" etc. — filters
+// goals by status and/or created_at date range, limits to last_n (or 30 max),
+// resolves assignee ids to names, and formats the reply as a markdown card.
+func (d *Daemon) intakeGoalQuery(ctx context.Context, q goalQueryAction) string {
+	all, err := d.goalSvc.List(ctx)
+	if err != nil {
+		return "查询失败：" + err.Error()
+	}
+
+	status := strings.TrimSpace(q.Status)
+	fromTime, toTime := parseGoalQueryDateRange(q.FromDate, q.ToDate)
+	filtered := filterGoals(all, status, fromTime, toTime)
+
+	total := len(filtered)
+	if total == 0 {
+		if status != "" {
+			return fmt.Sprintf("📋 没有状态为 %s 的任务", status)
+		}
+		return "📋 当前没有任务"
+	}
+
+	limit := maxGoalListSize
+	if q.LastN > 0 && q.LastN < limit {
+		limit = q.LastN
+	}
+	if limit > total {
+		limit = total
+	}
+
+	nameMap := d.loadAssigneeNames(ctx)
+
+	var b strings.Builder
+	b.WriteString(formatGoalQueryHeader(status, q.FromDate, q.ToDate, total, limit))
+	b.WriteString("\n\n")
+	for i := 0; i < limit; i++ {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(formatGoalEntry(filtered[i], nameMap))
+	}
+	if limit < total {
+		fmt.Fprintf(&b, "\n共 %d 个，当前显示前 %d 个。", total, limit)
+	}
+	return b.String()
+}
+
+// parseGoalQueryDateRange converts from_date/to_date (YYYY-MM-DD) into time
+// bounds: fromTime at start-of-day, toTime at end-of-day. Empty strings →
+// zero time (unbounded).
+func parseGoalQueryDateRange(fromDate, toDate string) (fromTime, toTime time.Time) {
+	fromDate = strings.TrimSpace(fromDate)
+	toDate = strings.TrimSpace(toDate)
+	if fromDate != "" {
+		if t, err := time.ParseInLocation("2006-01-02", fromDate, time.Local); err == nil {
+			fromTime = t
+		}
+	}
+	if toDate != "" {
+		if t, err := time.ParseInLocation("2006-01-02", toDate, time.Local); err == nil {
+			toTime = t.Add(24*time.Hour - time.Second)
+		}
+	}
+	return fromTime, toTime
+}
+
+// filterGoals returns goals matching the status and created_at date range.
+// A zero status or zero time means no filter on that dimension.
+func filterGoals(goals []service.Goal, status string, fromTime, toTime time.Time) []service.Goal {
+	hasDateFilter := !fromTime.IsZero() || !toTime.IsZero()
+	out := []service.Goal{}
+	for _, g := range goals {
+		if status != "" && g.Status != status {
+			continue
+		}
+		if hasDateFilter {
+			ct, err := time.Parse(time.RFC3339Nano, g.CreatedAt)
+			if err != nil {
+				continue
+			}
+			if !fromTime.IsZero() && ct.Before(fromTime) {
+				continue
+			}
+			if !toTime.IsZero() && ct.After(toTime) {
+				continue
+			}
+		}
+		out = append(out, g)
+	}
+	return out
+}
+
+// loadAssigneeNames queries agent and squad tables, returning a map of
+// id→name. Squad entries are keyed "squad:<id>" to avoid collision with
+// agent ids.
+func (d *Daemon) loadAssigneeNames(ctx context.Context) map[string]string {
+	nameMap := map[string]string{}
+	queryNames := func(table, prefix string) {
+		rows, err := d.st.DB().QueryContext(ctx, "SELECT id, name FROM "+table)
+		if err != nil {
+			return
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id, name string
+			if err := rows.Scan(&id, &name); err == nil {
+				nameMap[prefix+id] = name
+			}
+		}
+	}
+	queryNames("agent", "")
+	queryNames("squad", "squad:")
+	return nameMap
+}
+
+// resolveAssigneeName maps a goal's assignee_id to a display name using the
+// nameMap from loadAssigneeNames. Falls back to short id (or "未分配"/"人工"
+// for empty ids).
+func resolveAssigneeName(g service.Goal, nameMap map[string]string) string {
+	if g.AssigneeID == "" {
+		if g.AssigneeType == "human" {
+			return "人工"
+		}
+		return "未分配"
+	}
+	prefix := ""
+	if g.AssigneeType == "squad" {
+		prefix = "squad:"
+	}
+	if name, ok := nameMap[prefix+g.AssigneeID]; ok {
+		return name
+	}
+	return shortID(g.AssigneeID)
+}
+
+// formatGoalQueryHeader builds the header line: emoji + label + optional date
+// range + count.
+func formatGoalQueryHeader(status, fromDate, toDate string, total, shown int) string {
+	header := "📋 "
+	if status != "" {
+		if label, ok := goalStatusLabels[status]; ok {
+			header += label
+		} else {
+			header += "状态：" + status + " 的任务"
+		}
+	} else {
+		header += "任务列表"
+	}
+	fromDate = strings.TrimSpace(fromDate)
+	toDate = strings.TrimSpace(toDate)
+	if fromDate != "" || toDate != "" {
+		header += fmt.Sprintf(" %s ~ %s", fromDate, toDate)
+	}
+	header += fmt.Sprintf("（共 %d 个）", total)
+	return header
+}
+
+// formatGoalEntry renders one goal as a markdown block (title bold, then
+// description/assignee/status/created-at lines).
+func formatGoalEntry(g service.Goal, nameMap map[string]string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "**- %s（%s）**\n", g.Title, shortID(g.ID))
+	if g.Description != "" {
+		fmt.Fprintf(&b, "  **描述**：%s\n", firstLineIn(g.Description))
+	}
+	fmt.Fprintf(&b, "  **分配给**：%s（%s）｜**状态**：%s", resolveAssigneeName(g, nameMap), g.AssigneeType, g.Status)
+	if ct, err := time.Parse(time.RFC3339Nano, g.CreatedAt); err == nil {
+		fmt.Fprintf(&b, "｜**创建时间**：%s", ct.Local().Format("2006-01-02"))
+	}
+	b.WriteString("\n")
 	return b.String()
 }
 
