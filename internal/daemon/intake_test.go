@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -199,6 +200,167 @@ func TestIntakeCreateSchedule(t *testing.T) {
 	// Disabled schedules drop out of the list.
 	if r := d.intakeScheduleList(ctx); strings.Contains(r, "每小时巡检") {
 		t.Fatalf("disabled schedule must leave the list: %q", r)
+	}
+}
+
+// TestIntakeGoalQuery: the goal query filters by status, resolves assignee
+// names, paginates (10 per page), filters by created_at date range, and
+// always shows "创建时间" (stable — no longer depends on run.finished_at).
+func TestIntakeGoalQuery(t *testing.T) {
+	d, st := newIntakeDaemon(t)
+	ctx := context.Background()
+	domID := firstID(t, ctx, d, `SELECT id FROM domain`)
+
+	// Two done goals + one active goal.
+	g1, err := d.goalSvc.Create(ctx, service.Goal{
+		Title: "已完成任务A", Description: "修复登录bug", DomainID: domID,
+		AssigneeType: "agent", AssigneeID: "a1", Status: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g2, err := d.goalSvc.Create(ctx, service.Goal{
+		Title: "已完成任务B", Description: "添加导出功能", DomainID: domID,
+		AssigneeType: "agent", AssigneeID: "a1", Status: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g3, err := d.goalSvc.Create(ctx, service.Goal{
+		Title: "进行中的任务", Description: "优化性能", DomainID: domID,
+		AssigneeType: "agent", AssigneeID: "a1", Status: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = g3
+	for _, gid := range []string{g1.ID, g2.ID} {
+		if _, err := st.DB().ExecContext(ctx,
+			`UPDATE goal SET status='done' WHERE id=?`, gid); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 1. Query all done goals → both g1 and g2, with "创建时间" always shown.
+	reply := d.intakeGoalQuery(ctx, goalQueryAction{Status: "done"})
+	if !strings.Contains(reply, "已完成任务A") || !strings.Contains(reply, "已完成任务B") {
+		t.Fatalf("done query must list both done goals: %q", reply)
+	}
+	if strings.Contains(reply, "进行中的任务") {
+		t.Fatalf("done query must not list active goals: %q", reply)
+	}
+	if !strings.Contains(reply, "worker1") {
+		t.Fatalf("done query must resolve assignee name: %q", reply)
+	}
+	if !strings.Contains(reply, "done") {
+		t.Fatalf("done query must show status: %q", reply)
+	}
+	if !strings.Contains(reply, "创建时间") {
+		t.Fatalf("done query must always show 创建时间 (no longer depends on run.finished_at): %q", reply)
+	}
+	if !strings.Contains(reply, "已完成的任务") {
+		t.Fatalf("done query header must say 已完成的任务: %q", reply)
+	}
+
+	// 2. Query all goals (no status filter) → all three.
+	reply = d.intakeGoalQuery(ctx, goalQueryAction{})
+	if !strings.Contains(reply, "已完成任务A") || !strings.Contains(reply, "进行中的任务") {
+		t.Fatalf("unfiltered query must list all goals: %q", reply)
+	}
+	if !strings.Contains(reply, "任务列表") {
+		t.Fatalf("unfiltered query header must say 任务列表: %q", reply)
+	}
+
+	// 3. Query active goals → only g3.
+	reply = d.intakeGoalQuery(ctx, goalQueryAction{Status: "active"})
+	if !strings.Contains(reply, "进行中的任务") {
+		t.Fatalf("active query must list active goal: %q", reply)
+	}
+	if strings.Contains(reply, "已完成任务A") {
+		t.Fatalf("active query must not list done goals: %q", reply)
+	}
+
+	// 4. Empty result → friendly message.
+	reply = d.intakeGoalQuery(ctx, goalQueryAction{Status: "failed"})
+	if !strings.Contains(reply, "没有") {
+		t.Fatalf("empty result must say so: %q", reply)
+	}
+
+	// 5. Date range filter by created_at: set g1's created_at to old, g2's to
+	// today — a range covering only recent dates excludes g1.
+	oldDate := time.Now().AddDate(0, 0, -30).Format(time.RFC3339Nano)
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE goal SET created_at=? WHERE id=?`, oldDate, g1.ID); err != nil {
+		t.Fatal(err)
+	}
+	todayStr := time.Now().Format("2006-01-02")
+	reply = d.intakeGoalQuery(ctx, goalQueryAction{
+		Status: "done", FromDate: todayStr, ToDate: todayStr})
+	if strings.Contains(reply, "已完成任务A") {
+		t.Fatalf("date range must exclude 30-day-old goal: %q", reply)
+	}
+	if !strings.Contains(reply, "已完成任务B") {
+		t.Fatalf("date range must include today's goal: %q", reply)
+	}
+	if !strings.Contains(reply, todayStr+" ~ "+todayStr) {
+		t.Fatalf("header must show date range: %q", reply)
+	}
+
+	// 6. LastN: create 25 done goals, verify last_n limits the shown count.
+	d2, st2 := newIntakeDaemon(t)
+	domID2 := firstID(t, ctx, d2, `SELECT id FROM domain`)
+	for i := 0; i < 25; i++ {
+		g, err := d2.goalSvc.Create(ctx, service.Goal{
+			Title: fmt.Sprintf("批量任务%02d", i), DomainID: domID2,
+			AssigneeType: "agent", AssigneeID: "a1", Status: "active"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st2.DB().ExecContext(ctx,
+			`UPDATE goal SET status='done' WHERE id=?`, g.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// LastN=1: only 1 entry shown, header says "共 25 个".
+	reply = d2.intakeGoalQuery(ctx, goalQueryAction{Status: "done", LastN: 1})
+	if !strings.Contains(reply, "共 25 个") {
+		t.Fatalf("last_n=1 must still show total count: %q", reply)
+	}
+	if strings.Count(reply, "**- ") != 1 {
+		t.Fatalf("last_n=1 must show exactly 1 goal entry, got %d: %q", strings.Count(reply, "**- "), reply)
+	}
+	// LastN=3: exactly 3 entries.
+	reply = d2.intakeGoalQuery(ctx, goalQueryAction{Status: "done", LastN: 3})
+	if strings.Count(reply, "**- ") != 3 {
+		t.Fatalf("last_n=3 must show exactly 3 goal entries, got %d: %q", strings.Count(reply, "**- "), reply)
+	}
+	// No LastN: all 25 shown (under 30 cap), no truncation notice.
+	reply = d2.intakeGoalQuery(ctx, goalQueryAction{Status: "done"})
+	if strings.Count(reply, "**- ") != 25 {
+		t.Fatalf("no last_n must show all 25 goals, got %d: %q", strings.Count(reply, "**- "), reply)
+	}
+	if strings.Contains(reply, "当前显示前") {
+		t.Fatalf("under-30 list must not show truncation notice: %q", reply)
+	}
+
+	// 7. Max cap: 35 goals, no last_n → capped at 30 + truncation notice.
+	d3, st3 := newIntakeDaemon(t)
+	domID3 := firstID(t, ctx, d3, `SELECT id FROM domain`)
+	for i := 0; i < 35; i++ {
+		g, err := d3.goalSvc.Create(ctx, service.Goal{
+			Title: fmt.Sprintf("超限任务%02d", i), DomainID: domID3,
+			AssigneeType: "agent", AssigneeID: "a1", Status: "active"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st3.DB().ExecContext(ctx,
+			`UPDATE goal SET status='done' WHERE id=?`, g.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reply = d3.intakeGoalQuery(ctx, goalQueryAction{Status: "done"})
+	if strings.Count(reply, "**- ") != 30 {
+		t.Fatalf("35 goals with no last_n must cap at 30, got %d: %q", strings.Count(reply, "**- "), reply)
+	}
+	if !strings.Contains(reply, "共 35 个") || !strings.Contains(reply, "当前显示前 30 个") {
+		t.Fatalf("truncated list must show notice: %q", reply)
 	}
 }
 
