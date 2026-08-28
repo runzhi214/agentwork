@@ -179,9 +179,13 @@ func (d *Daemon) onGoalFinished(_ context.Context, e events.Event) {
 		return
 	}
 	// A terminal goal has no more wakes (决策 6-21 — sessions retired with
-	// the local execution path, CLI 分支).
+	// the local execution path, CLI 分支). Handle both cancelled and failed:
+	// cancelled goals drop their running runs; failed goals (owner retries
+	// exhausted, handoff-loop reject, mention-cycle) must also stop their
+	// still-running sub-goal runs — without this, sub-tasks stay "running"
+	// under a dead goal.
 	status, _ := m["status"].(string)
-	if status != "cancelled" {
+	if status != "cancelled" && status != "failed" {
 		return
 	}
 	goalID, _ := m["goal_id"].(string)
@@ -203,15 +207,18 @@ func (d *Daemon) onGoalFinished(_ context.Context, e events.Event) {
 		}
 	}
 	for _, id := range ids {
-		logging.Infof("daemon: goal cancelled — stopping run %s", id)
+		logging.Infof("daemon: goal %s — stopping run %s", status, id)
 		d.cancelRun(id, "stopped")
 	}
 	// Cleanup the goal's feat branch (决策 7-4): cancelled is terminal — no
-	// cancelled→active transition — so the branch is garbage. The goal title
-	// and domain git config are loaded for the cleanup logs and the remote
-	// delete. A scratch domain (git_url="") has no branch to clean; a missing
-	// domain row (deleted first) is a no-op.
-	go d.cleanupCancelledGoalBranches(goalID)
+	// cancelled→active transition — so the branch is garbage. A failed goal
+	// may be reopened (failed→active), so its branch is kept for the next
+	// cycle. The goal title and domain git config are loaded for the cleanup
+	// logs and the remote delete. A scratch domain (git_url="") has no branch
+	// to clean; a missing domain row (deleted first) is a no-op.
+	if status == "cancelled" {
+		go d.cleanupCancelledGoalBranches(goalID)
+	}
 }
 
 // cleanupCancelledGoalBranches loads a cancelled goal's domain git config and

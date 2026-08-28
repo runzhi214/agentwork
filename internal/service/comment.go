@@ -415,6 +415,8 @@ func (s *CommentService) forceMentionCycleFailed(ctx context.Context, goalID str
 		newID(), goalID, comment, ts)
 	_, _ = s.st.DB().ExecContext(ctx,
 		`UPDATE run SET status='cancelled', cancel_reason='goal_terminal' WHERE goal_id=? AND status='queued'`, goalID)
+	_, _ = s.st.DB().ExecContext(ctx,
+		`UPDATE sub_goal SET status='cancelled' WHERE goal_id=? AND status NOT IN ('verified','cancelled','failed')`, goalID)
 	s.bus.Publish(ctx, events.Event{Topic: "goal:finished", Payload: map[string]any{
 		"goal_id": goalID, "status": "failed", "summary": reason,
 	}})

@@ -1358,6 +1358,12 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 				`UPDATE run SET status='cancelled', cancel_reason='goal_terminal' WHERE goal_id=? AND status='queued'`, rc.GoalID); err != nil {
 				return fmt.Errorf("cancel queued runs on fail: %w", err)
 			}
+			// Cascade-cancel active sub-goals (same as the cancel path, 决策 6-8):
+			// terminal ones keep their history, active work stops with the goal.
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE sub_goal SET status='cancelled' WHERE goal_id=? AND status NOT IN ('verified','cancelled','failed')`, rc.GoalID); err != nil {
+				return fmt.Errorf("cancel sub-goals on fail: %w", err)
+			}
 			// The goal ACTUALLY failed here (attempts exhausted) — the failure
 			// card fires once, not once per failed attempt (决策 5-10).
 			pendingEvents = append(pendingEvents, events.Event{Topic: "goal:finished", Payload: map[string]any{
@@ -1611,6 +1617,10 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision
 			if _, err := s.st.DB().ExecContext(ctx,
 				`UPDATE run SET status='cancelled', cancel_reason='goal_terminal' WHERE goal_id=? AND status='queued'`, goalID); err != nil {
 				return nil, fmt.Errorf("cancel queued runs on handoff-loop fail: %w", err)
+			}
+			if _, err := s.st.DB().ExecContext(ctx,
+				`UPDATE sub_goal SET status='cancelled' WHERE goal_id=? AND status NOT IN ('verified','cancelled','failed')`, goalID); err != nil {
+				return nil, fmt.Errorf("cancel sub-goals on handoff-loop fail: %w", err)
 			}
 			s.bus.Publish(ctx, events.Event{Topic: "goal:finished", Payload: map[string]any{
 				"goal_id": goalID, "status": "failed", "summary": loopNote,

@@ -946,6 +946,73 @@ func TestGoalCancelDeleteCascade(t *testing.T) {
 	}
 }
 
+// TestGoalFailSubGoalCascade: goal fail cascades to sub-goals (terminal
+// ones keep history), mirroring the cancel cascade (决策 6-8). The owner
+// run exhausts retries → goal fails → active sub-goals stop, verified ones
+// keep their status.
+func TestGoalFailSubGoalCascade(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "a")
+	b := seedAgent(t, st, "b")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: a, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	// A running sub-goal — should be cancelled when the goal fails.
+	sg, err := gs.CreateSubGoal(ctx, g.ID, "running item", "sub", b, "", "agent", a)
+	if err != nil {
+		t.Fatalf("create sub-goal: %v", err)
+	}
+	// A second sub-goal: complete its run so it reaches verified — terminal
+	// history must survive the goal failure.
+	sg2, err := gs.CreateSubGoal(ctx, g.ID, "done item", "sub2", b, "", "agent", a)
+	if err != nil {
+		t.Fatalf("create sub-goal 2: %v", err)
+	}
+	var sg2Run string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE sub_goal_id=? LIMIT 1`, sg2.ID).Scan(&sg2Run); err != nil {
+		t.Fatalf("sub-goal 2 run: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET base_ref='b1', head_ref='h1' WHERE id=?`, sg2Run); err != nil {
+		t.Fatalf("stamp sub-goal 2 run: %v", err)
+	}
+	if err := rs.Finish(ctx, sg2Run, "completed", "done the work item"); err != nil {
+		t.Fatalf("finish sub-goal 2: %v", err)
+	}
+	verified, _ := gs.GetSubGoal(ctx, sg2.ID)
+	if verified.Status != "verified" {
+		t.Fatalf("sub-goal 2 must be verified before goal fail, got %q", verified.Status)
+	}
+	// Exhaust the owner run retries (maxAttempts=3): each failure enqueues a
+	// retry; the third failure transitions the goal to failed and cascades.
+	for i := 0; i < 3; i++ {
+		var ownerRun string
+		if err := st.DB().QueryRowContext(ctx,
+			`SELECT id FROM run WHERE goal_id=? AND role='owner' AND status='queued' ORDER BY created_at DESC LIMIT 1`, g.ID).Scan(&ownerRun); err != nil {
+			t.Fatalf("owner run %d: %v", i, err)
+		}
+		if err := rs.Finish(ctx, ownerRun, "failed", "boom"); err != nil {
+			t.Fatalf("finish owner %d: %v", i, err)
+		}
+	}
+	after, _ := gs.Get(ctx, g.ID)
+	if after.Status != "failed" {
+		t.Fatalf("goal must be failed after 3 attempts, got %q", after.Status)
+	}
+	afterSg, _ := gs.GetSubGoal(ctx, sg.ID)
+	if afterSg.Status != "cancelled" {
+		t.Fatalf("running sub-goal must cancel on goal fail, got %q", afterSg.Status)
+	}
+	afterSg2, _ := gs.GetSubGoal(ctx, sg2.ID)
+	if afterSg2.Status != "verified" {
+		t.Fatalf("verified sub-goal must keep history on goal fail, got %q", afterSg2.Status)
+	}
+}
+
 // TestOwnerRunStaysActiveWithPendingWork: the v2 finalization guard — an owner
 // run completing while sub-goals are still working or changes are ready must
 // NOT reach the gates/done judgment; the goal stays active and the attention
